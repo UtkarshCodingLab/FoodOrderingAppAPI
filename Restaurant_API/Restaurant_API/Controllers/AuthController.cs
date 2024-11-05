@@ -1,0 +1,147 @@
+﻿using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.IdentityModel.Tokens;
+using Restaurant_API.Data;
+using Restaurant_API.Models;
+using Restaurant_API.Models.Dto;
+using Restaurant_API.Utility;
+using System.IdentityModel.Tokens.Jwt;
+using System.Net;
+using System.Security.Claims;
+using System.Text;
+
+namespace Restaurant_API.Controllers
+{
+    [Route("api/auth")]
+    [ApiController]
+    public class AuthController : ControllerBase
+    {
+        private readonly ApplicationDbContext _db;
+        private ApiResponse _response;
+        private string secretKey;
+        private readonly UserManager<ApplicationUser> _userManager;
+        private readonly RoleManager<IdentityRole> _roleManager;
+
+        public AuthController(ApplicationDbContext db, IConfiguration configuration, UserManager<ApplicationUser> userManager, RoleManager<IdentityRole> roleManager)
+        {
+            _db = db;
+            secretKey = configuration.GetValue<string>("ApiSettings:Secret");
+            _response = new ApiResponse();
+            _userManager = userManager;
+            _roleManager = roleManager;
+        }
+
+        [HttpPost("register")]
+        public async Task<IActionResult> Register([FromBody] RegisterRequestDTO model)
+        {
+            ApplicationUser userFromDb = _db.ApplicationUsers.FirstOrDefault(u => u.UserName.ToLower() == model.UserName.ToLower());
+
+            if (userFromDb != null)
+            {
+                _response.StatusCode = HttpStatusCode.BadRequest;
+                _response.IsSuccess = false;
+                _response.ErrorMessages.Add("Username already exists");
+                return BadRequest(_response);
+            }
+
+            ApplicationUser newUser = new()
+            {
+                UserName = model.UserName,
+                Email = model.UserName,
+                NormalizedEmail = model.UserName.ToUpper(),
+                Name = model.Name
+            };
+
+            var result = await _userManager.CreateAsync(newUser, model.Password);
+
+            if (result.Succeeded)
+            {
+                if(!_roleManager.RoleExistsAsync(StaticDetails.Role_Admin).GetAwaiter().GetResult())
+                {
+                    // create roles in database
+
+                    await _roleManager.CreateAsync(new IdentityRole(StaticDetails.Role_Admin));
+                    await _roleManager.CreateAsync(new IdentityRole(StaticDetails.Role_Customer));
+                }
+
+                if (model.Role.ToLower() == StaticDetails.Role_Admin)
+                {
+                    await _userManager.AddToRoleAsync(newUser, StaticDetails.Role_Admin);
+                }
+                else
+                {
+                    await _userManager.AddToRoleAsync(newUser, StaticDetails.Role_Customer);
+                }
+
+                _response.StatusCode = HttpStatusCode.OK;
+                _response.IsSuccess = true;
+                return Ok(_response);
+
+            }
+
+            _response.StatusCode = HttpStatusCode.BadRequest;
+            _response.IsSuccess = false;
+            _response.ErrorMessages.Add("Error while registering");
+            return BadRequest(_response);
+  
+        }
+
+        [HttpPost("login")]
+        public async Task<IActionResult> Login([FromBody] LoginRequestDTO model)
+        {
+            ApplicationUser userFromDb = _db.ApplicationUsers.FirstOrDefault(u => u.UserName.ToLower() == model.UserName.ToLower());
+
+            bool isValid = await _userManager.CheckPasswordAsync(userFromDb, model.Password);
+
+            if (isValid==false)
+            {
+                _response.Result = new LoginRequestDTO();
+                _response.StatusCode=HttpStatusCode.BadRequest;
+                _response.IsSuccess = false;
+                _response.ErrorMessages.Add("Username or password is incorrect");
+                return BadRequest(_response);
+            }
+
+            // if isValid is True we have to generate JWT token and add that to the LoginResponseDTO
+            var roles = await _userManager.GetRolesAsync(userFromDb);
+            JwtSecurityTokenHandler tokenHandler = new();
+            byte[] key = Encoding.ASCII.GetBytes(secretKey);
+
+            SecurityTokenDescriptor tokenDescriptor = new()
+            {
+                Subject = new ClaimsIdentity(new Claim[]
+                {
+                    new Claim("fullName",userFromDb.Name),
+                    new Claim("id",userFromDb.Id.ToString()),
+                    new Claim(ClaimTypes.Email,userFromDb.UserName.ToString()),
+                    new Claim(ClaimTypes.Role, roles.FirstOrDefault()),
+                }),
+                Expires = DateTime.UtcNow.AddDays(7),
+                SigningCredentials = new SigningCredentials(new SymmetricSecurityKey(key), SecurityAlgorithms.HmacSha256Signature)
+            };
+
+            SecurityToken token = tokenHandler.CreateToken(tokenDescriptor);
+
+            LoginResponseDTO loginResponse = new()
+            {
+                Email = userFromDb.Email,
+                Token = tokenHandler.WriteToken(token)
+            };
+
+            if(loginResponse.Email==null || string.IsNullOrEmpty(loginResponse.Token))
+            {
+                _response.StatusCode = HttpStatusCode.BadRequest;
+                _response.IsSuccess = false;
+                _response.ErrorMessages.Add("Username or password is incorrect");
+                return BadRequest(_response);
+            }
+
+            _response.StatusCode = HttpStatusCode.OK;
+            _response.IsSuccess = true;
+            _response.Result = loginResponse;
+            return Ok(_response);
+
+        }
+    }
+}
